@@ -32,60 +32,218 @@ No Node, pip, or Composer packages. `lib/pagespeed.py` uses Python’s standard 
 
 If an optional tool is missing, lookup still runs and marks that section as skipped.
 
-### Install packages
+Follow **one** of the install guides below, then add an [API key](#api-key).
 
-**Required** (do this first):
+## How to install
+
+`./lookup` is a Bash script. Use a real Unix shell: Linux terminal, macOS Terminal, or **Windows Subsystem for Linux (WSL)**. It will not run in PowerShell or `cmd.exe`.
+
+---
+
+### Linux / Ubuntu
+
+These commands are for Ubuntu and Debian. Fedora/RHEL notes are at the end of this section.
+
+1. Open a terminal.
+
+2. Install Git (needed to clone the repo):
+
+   ```bash
+   sudo apt update
+   sudo apt install -y git
+   ```
+
+3. Install **required** packages:
+
+   ```bash
+   sudo apt install -y curl python3
+   ```
+
+4. Install **optional** packages (recommended for a full report):
+
+   ```bash
+   sudo apt install -y dnsutils mtr-tiny apache2-utils
+   ```
+
+   On newer Ubuntu, if `dnsutils` is not found:
+
+   ```bash
+   sudo apt install -y bind9-dnsutils mtr-tiny apache2-utils
+   ```
+
+   What those packages provide: `host` (nameservers), `mtr` (route / packet loss), `ab` (small load test).
+
+5. Confirm the required tools exist. Each of `bash`, `curl`, and `python3` must print a path:
+
+   ```bash
+   command -v bash curl python3 host mtr ab
+   ```
+
+6. Clone the repo and make the scripts executable:
+
+   ```bash
+   git clone https://github.com/getneerajk/url-analyzer.git
+   cd url-analyzer
+   chmod +x lookup lib/pagespeed.py
+   ```
+
+7. Continue at [API key](#api-key).
+
+**One-line package install (Ubuntu/Debian):**
 
 ```bash
-# Debian / Ubuntu
-sudo apt update
-sudo apt install -y curl python3
-
-# Fedora / RHEL
-sudo dnf install -y curl python3
-
-# macOS (Homebrew)
-brew install curl python3
+sudo apt update && sudo apt install -y git curl python3 dnsutils mtr-tiny apache2-utils
 ```
 
-**Optional** (nameservers, route, load test):
+**Fedora / RHEL:**
 
 ```bash
-# Debian / Ubuntu
-sudo apt install -y dnsutils mtr-tiny apache2-utils
-
-# Fedora / RHEL
-sudo dnf install -y bind-utils mtr httpd-tools
-
-# macOS (Homebrew) — `ab` comes from httpd; `host` comes from bind
-brew install bind mtr httpd
+sudo dnf install -y git curl python3
+sudo dnf install -y bind-utils mtr httpd-tools   # optional: host, mtr, ab
 ```
 
-On newer Ubuntu, if `dnsutils` is not found, use `bind9-dnsutils` instead.
+Then clone as in step 6.
 
-**Everything on Debian/Ubuntu in one line:**
+---
 
-```bash
-sudo apt update && sudo apt install -y curl python3 dnsutils mtr-tiny apache2-utils
-```
+### macOS
 
-Check what you have:
+Use Terminal (or iTerm). Homebrew is the easiest way to get the optional tools.
 
-```bash
-command -v bash curl python3 host mtr ab
-```
+1. Open **Terminal**.
 
-`curl` and `python3` must print a path. The others can be missing.
+2. Install Apple’s command-line tools if you do not have them yet (needed for Git and compilers):
 
-## Setup
+   ```bash
+   xcode-select --install
+   ```
 
-```bash
-git clone https://github.com/getneerajk/url-analyzer.git
-cd url-analyzer
-chmod +x lookup lib/pagespeed.py
-```
+   Click **Install** in the dialog and wait until it finishes.
 
-### API key
+3. Install [Homebrew](https://brew.sh) if `brew` is not already available:
+
+   ```bash
+   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+   ```
+
+   On Apple Silicon (M1/M2/M3/M4), add Homebrew to your PATH if the installer says to:
+
+   ```bash
+   echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> ~/.zprofile
+   eval "$(/opt/homebrew/bin/brew shellenv)"
+   ```
+
+4. Install **required** packages. macOS often already has `curl` and `python3`; this ensures they are present:
+
+   ```bash
+   brew install curl python3
+   ```
+
+5. Install **optional** packages (recommended):
+
+   ```bash
+   brew install bind mtr httpd
+   ```
+
+   - `bind` provides `host`
+   - `mtr` provides `mtr` (you may be asked for your password when it runs)
+   - `httpd` provides `ab`
+
+6. Confirm the required tools exist. Each of `bash`, `curl`, and `python3` must print a path:
+
+   ```bash
+   command -v bash curl python3 host mtr ab
+   ```
+
+   If `ab` is not found after installing `httpd`, try:
+
+   ```bash
+   brew link httpd
+   command -v ab
+   ```
+
+7. Clone the repo and make the scripts executable:
+
+   ```bash
+   git clone https://github.com/getneerajk/url-analyzer.git
+   cd url-analyzer
+   chmod +x lookup lib/pagespeed.py
+   ```
+
+8. Continue at [API key](#api-key).
+
+---
+
+### Windows
+
+Do **not** run `./lookup` in PowerShell or Command Prompt. Install **WSL** with Ubuntu, then follow the Linux steps inside that Ubuntu terminal.
+
+1. Open **PowerShell as Administrator** (right-click Start → Windows Terminal / PowerShell → Run as administrator).
+
+2. Install WSL and Ubuntu:
+
+   ```powershell
+   wsl --install -d Ubuntu
+   ```
+
+   If WSL is already installed and you only need Ubuntu:
+
+   ```powershell
+   wsl --install -d Ubuntu
+   wsl -l -v
+   ```
+
+3. Restart the PC if Windows asks you to.
+
+4. Open **Ubuntu** from the Start menu. The first launch asks you to create a Linux username and password. This password is for `sudo` inside Ubuntu; it is not your Windows password.
+
+5. Update Ubuntu and install Git plus **required** packages:
+
+   ```bash
+   sudo apt update
+   sudo apt install -y git curl python3
+   ```
+
+6. Install **optional** packages (recommended):
+
+   ```bash
+   sudo apt install -y dnsutils mtr-tiny apache2-utils
+   ```
+
+   If `dnsutils` is not found:
+
+   ```bash
+   sudo apt install -y bind9-dnsutils mtr-tiny apache2-utils
+   ```
+
+7. Confirm the required tools exist. Each of `bash`, `curl`, and `python3` must print a path:
+
+   ```bash
+   command -v bash curl python3 host mtr ab
+   ```
+
+8. Clone the repo **inside WSL** (paths like `/home/you/...`, not `C:\...`):
+
+   ```bash
+   git clone https://github.com/getneerajk/url-analyzer.git
+   cd url-analyzer
+   chmod +x lookup lib/pagespeed.py
+   ```
+
+   If you already cloned the folder in Windows Explorer, you can open it from WSL with:
+
+   ```bash
+   cd /mnt/c/Users/YOUR_WINDOWS_USERNAME/path/to/url-analyzer
+   chmod +x lookup lib/pagespeed.py
+   ```
+
+   A clone inside the Linux home directory is faster and avoids Windows/Linux line-ending issues.
+
+9. Continue at [API key](#api-key). Run those commands in the **same Ubuntu/WSL terminal**.
+
+**Git Bash** (from Git for Windows) can run `./lookup` with `curl` and `python3`, but `mtr` is usually unavailable and some path/line-ending issues show up. WSL is the supported Windows setup.
+
+## API key
 
 Lighthouse data comes from the [PageSpeed Insights API](https://developers.google.com/speed/docs/insights/v5/get-started). Without a key, lookup still checks headers and timing, but skips Lighthouse.
 
