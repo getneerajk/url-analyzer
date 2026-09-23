@@ -1,8 +1,10 @@
 # url-analyzer
 
+**Version 2** (this branch: `v2`). What changed is in [CHANGELOG.md](CHANGELOG.md). The original Bash release stays on [`main`](https://github.com/getneerajk/url-analyzer/tree/main).
+
 A command-line tool that checks a website’s **speed, caching, and Core Web Vitals**. It fetches HTTP headers, measures network timing, runs Google PageSpeed Insights (Lighthouse) for mobile and desktop, and writes a dated report you (or an AI agent) can read.
 
-You do not need to read the source to use it. Clone, add an API key, run `./lookup <url>`.
+You do not need to read the source to use it. Install Python 3, clone, add an API key, run `lookup` (or `./lookup` on Linux/macOS).
 
 ## What you get
 
@@ -18,230 +20,148 @@ Typical flags cover cache HIT/MISS, TTFB, compression, Cloudflare/LiteSpeed, ren
 
 ## Requirements
 
-No Node, pip, or Composer packages. `lib/pagespeed.py` uses Python’s standard library only.
+`lookup` is a **Python 3** program (3.8 or newer). It uses only the standard library — no pip, Node, or Composer packages.
 
-| Tool | Required? | Why | Debian/Ubuntu package |
-| --- | --- | --- | --- |
-| `bash` | Yes | Runs `./lookup` | (already installed) |
-| `curl` | Yes | Headers and timing | `curl` |
-| `python3` | Yes | PageSpeed / Lighthouse | `python3` |
-| Google PageSpeed API key | Yes for Lighthouse | See [API key](#api-key) | — |
-| `host` | Optional | Nameserver lookup | `dnsutils` or `bind9-dnsutils` |
-| `mtr` | Optional | Route / packet-loss check | `mtr-tiny` |
-| `ab` | Optional | Light origin load test | `apache2-utils` |
+| Tool | Required? | Why |
+| --- | --- | --- |
+| Python 3.8+ | Yes | Runs `lookup` and PageSpeed analysis |
+| Git | Yes to clone | Download the repo |
+| Google PageSpeed API key | Yes for Lighthouse | See [API key](#api-key) |
+| `nslookup` or `host` | Optional | Nameserver lookup (Windows includes `nslookup`) |
+| `mtr` | Optional | Route / packet-loss check |
 
-If an optional tool is missing, lookup still runs and marks that section as skipped.
+Headers, timing, load test, and Lighthouse all run in Python. If `mtr` is missing, that section is skipped.
 
 Follow **one** of the install guides below, then add an [API key](#api-key).
 
 ## How to install
 
-`./lookup` is a Bash script. Use a real Unix shell: Linux terminal, macOS Terminal, or **Windows Subsystem for Linux (WSL)**. It will not run in PowerShell or `cmd.exe`.
-
 ---
 
 ### Linux / Ubuntu
 
-These commands are for Ubuntu and Debian. Fedora/RHEL notes are at the end of this section.
-
 1. Open a terminal.
 
-2. Install Git (needed to clone the repo):
+2. Install Git and Python 3:
 
    ```bash
    sudo apt update
-   sudo apt install -y git
+   sudo apt install -y git python3
    ```
 
-3. Install **required** packages:
+   Fedora / RHEL:
 
    ```bash
-   sudo apt install -y curl python3
+   sudo dnf install -y git python3
    ```
 
-4. Install **optional** packages (recommended for a full report):
+3. Optional — route analysis:
 
    ```bash
-   sudo apt install -y dnsutils mtr-tiny apache2-utils
+   sudo apt install -y mtr-tiny
    ```
 
-   On newer Ubuntu, if `dnsutils` is not found:
+4. Confirm Python works:
 
    ```bash
-   sudo apt install -y bind9-dnsutils mtr-tiny apache2-utils
+   python3 --version
    ```
 
-   What those packages provide: `host` (nameservers), `mtr` (route / packet loss), `ab` (small load test).
+   You need 3.8 or newer.
 
-5. Confirm the required tools exist. Each of `bash`, `curl`, and `python3` must print a path:
-
-   ```bash
-   command -v bash curl python3 host mtr ab
-   ```
-
-6. Clone the repo and make the scripts executable:
+5. Clone the repo:
 
    ```bash
    git clone https://github.com/getneerajk/url-analyzer.git
    cd url-analyzer
-   chmod +x lookup lib/pagespeed.py
+   chmod +x lookup
    ```
 
-7. Continue at [API key](#api-key).
-
-**One-line package install (Ubuntu/Debian):**
-
-```bash
-sudo apt update && sudo apt install -y git curl python3 dnsutils mtr-tiny apache2-utils
-```
-
-**Fedora / RHEL:**
-
-```bash
-sudo dnf install -y git curl python3
-sudo dnf install -y bind-utils mtr httpd-tools   # optional: host, mtr, ab
-```
-
-Then clone as in step 6.
+6. Continue at [API key](#api-key).
 
 ---
 
 ### macOS
 
-Use Terminal (or iTerm). Homebrew is the easiest way to get the optional tools.
-
 1. Open **Terminal**.
 
-2. Install Apple’s command-line tools if you do not have them yet (needed for Git and compilers):
+2. Install Apple’s command-line tools if Git is missing:
 
    ```bash
    xcode-select --install
    ```
 
-   Click **Install** in the dialog and wait until it finishes.
+   Click **Install** and wait until it finishes.
 
-3. Install [Homebrew](https://brew.sh) if `brew` is not already available:
-
-   ```bash
-   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-   ```
-
-   On Apple Silicon (M1/M2/M3/M4), add Homebrew to your PATH if the installer says to:
+3. Check Python:
 
    ```bash
-   echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> ~/.zprofile
-   eval "$(/opt/homebrew/bin/brew shellenv)"
+   python3 --version
    ```
 
-4. Install **required** packages. macOS often already has `curl` and `python3`; this ensures they are present:
+   If that fails or the version is older than 3.8, install Python from [python.org](https://www.python.org/downloads/) or Homebrew:
 
    ```bash
-   brew install curl python3
+   brew install python3
    ```
 
-5. Install **optional** packages (recommended):
+   (Install [Homebrew](https://brew.sh) first if you do not have `brew`.)
+
+4. Optional — route analysis:
 
    ```bash
-   brew install bind mtr httpd
+   brew install mtr
    ```
 
-   - `bind` provides `host`
-   - `mtr` provides `mtr` (you may be asked for your password when it runs)
-   - `httpd` provides `ab`
-
-6. Confirm the required tools exist. Each of `bash`, `curl`, and `python3` must print a path:
-
-   ```bash
-   command -v bash curl python3 host mtr ab
-   ```
-
-   If `ab` is not found after installing `httpd`, try:
-
-   ```bash
-   brew link httpd
-   command -v ab
-   ```
-
-7. Clone the repo and make the scripts executable:
+5. Clone the repo:
 
    ```bash
    git clone https://github.com/getneerajk/url-analyzer.git
    cd url-analyzer
-   chmod +x lookup lib/pagespeed.py
+   chmod +x lookup
    ```
 
-8. Continue at [API key](#api-key).
+6. Continue at [API key](#api-key).
 
 ---
 
 ### Windows
 
-Do **not** run `./lookup` in PowerShell or Command Prompt. Install **WSL** with Ubuntu, then follow the Linux steps inside that Ubuntu terminal.
+You do **not** need Ubuntu or WSL. Install Python, then run `lookup` in Command Prompt or PowerShell.
 
-1. Open **PowerShell as Administrator** (right-click Start → Windows Terminal / PowerShell → Run as administrator).
+1. Install **Python 3.8+** from [https://www.python.org/downloads/](https://www.python.org/downloads/).
 
-2. Install WSL and Ubuntu:
+   On the first installer screen, check **Add python.exe to PATH**, then click **Install Now**.
+
+2. Install **Git** from [https://git-scm.com/download/win](https://git-scm.com/download/win) if you do not have it. Default options are fine.
+
+3. Close and reopen Command Prompt or PowerShell so PATH updates apply.
+
+4. Confirm Python:
 
    ```powershell
-   wsl --install -d Ubuntu
+   py -3 --version
    ```
 
-   If WSL is already installed and you only need Ubuntu:
+   If `py` is not found, try `python --version`. You need 3.8 or newer.
+
+5. Clone the repo:
 
    ```powershell
-   wsl --install -d Ubuntu
-   wsl -l -v
-   ```
-
-3. Restart the PC if Windows asks you to.
-
-4. Open **Ubuntu** from the Start menu. The first launch asks you to create a Linux username and password. This password is for `sudo` inside Ubuntu; it is not your Windows password.
-
-5. Update Ubuntu and install Git plus **required** packages:
-
-   ```bash
-   sudo apt update
-   sudo apt install -y git curl python3
-   ```
-
-6. Install **optional** packages (recommended):
-
-   ```bash
-   sudo apt install -y dnsutils mtr-tiny apache2-utils
-   ```
-
-   If `dnsutils` is not found:
-
-   ```bash
-   sudo apt install -y bind9-dnsutils mtr-tiny apache2-utils
-   ```
-
-7. Confirm the required tools exist. Each of `bash`, `curl`, and `python3` must print a path:
-
-   ```bash
-   command -v bash curl python3 host mtr ab
-   ```
-
-8. Clone the repo **inside WSL** (paths like `/home/you/...`, not `C:\...`):
-
-   ```bash
    git clone https://github.com/getneerajk/url-analyzer.git
    cd url-analyzer
-   chmod +x lookup lib/pagespeed.py
    ```
 
-   If you already cloned the folder in Windows Explorer, you can open it from WSL with:
+6. Continue at [API key](#api-key). On Windows, copy the key file with:
 
-   ```bash
-   cd /mnt/c/Users/YOUR_WINDOWS_USERNAME/path/to/url-analyzer
-   chmod +x lookup lib/pagespeed.py
+   ```powershell
+   copy .pagespeed_api_key.example .pagespeed_api_key
+   notepad .pagespeed_api_key
    ```
 
-   A clone inside the Linux home directory is faster and avoids Windows/Linux line-ending issues.
+   Paste the key on one line, save, and close Notepad.
 
-9. Continue at [API key](#api-key). Run those commands in the **same Ubuntu/WSL terminal**.
-
-**Git Bash** (from Git for Windows) can run `./lookup` with `curl` and `python3`, but `mtr` is usually unavailable and some path/line-ending issues show up. WSL is the supported Windows setup.
+`mtr` is uncommon on Windows. Lookup still runs; the route section is skipped.
 
 ## API key
 
@@ -254,6 +174,8 @@ Lighthouse data comes from the [PageSpeed Insights API](https://developers.googl
 
 Put the key in **one** of these places (never commit the real key):
 
+**Linux / macOS:**
+
 ```bash
 # Option A — project file (gitignored)
 cp .pagespeed_api_key.example .pagespeed_api_key
@@ -263,20 +185,48 @@ cp .pagespeed_api_key.example .pagespeed_api_key
 export PAGESPEED_API_KEY='your-key-here'
 ```
 
+**Windows (PowerShell):**
+
+```powershell
+copy .pagespeed_api_key.example .pagespeed_api_key
+notepad .pagespeed_api_key
+# or: $env:PAGESPEED_API_KEY='your-key-here'
+```
+
 Test the key:
 
 ```bash
 python3 lib/pagespeed.py --test-key
 ```
 
+On Windows:
+
+```powershell
+py -3 lib/pagespeed.py --test-key
+```
+
 If Google says the key is invalid or “expired”, the usual causes are: the API is not enabled on the **same** GCP project as the key, the key is restricted to HTTP referrers, or you regenerated the key and the old one is dead.
 
 ## Usage
 
-From the project root:
+From the project root.
+
+**Linux / macOS:**
 
 ```bash
 ./lookup https://example.com/
+```
+
+**Windows (Command Prompt or PowerShell):**
+
+```powershell
+lookup https://example.com/
+```
+
+If that fails, call Python directly:
+
+```powershell
+py -3 lookup https://example.com/
 ```
 
 A domain without a scheme is treated as HTTPS:
@@ -301,9 +251,9 @@ Start with the terminal output, then open the `.log` file in that run folder.
 | Core Web Vitals | LCP, FCP, TBT, CLS, TTFB, Speed Index, TTI |
 | Chrome UX Report | Real-user (field) data when Google has enough traffic |
 | Speed flags | Cache, TTFB, compression, LCP causes |
-| curl timing | DNS, TCP, TLS, TTFB from **your** machine |
-| mtr | Loss / latency on the path to the origin |
-| ab | How the origin behaves under a small concurrent load |
+| Network timing | DNS, TCP, TLS, TTFB from **your** machine |
+| mtr | Loss / latency on the path to the origin (skipped if `mtr` is not installed) |
+| Load test | How the origin behaves under a small concurrent load (built in; no `ab`) |
 | Raw headers | Cache-Control, LiteSpeed, Cloudflare, HSTS, etc. |
 
 For LCP detail (element, image URL, opportunities), open `pagespeed_mobile.json` or `pagespeed_desktop.json` in the same folder. Those files are large; search for `largest-contentful-paint` or `audits`.
@@ -314,7 +264,7 @@ Do not reuse an old `log/` folder unless you mean to compare history. Each run i
 
 Ask in plain language, for example: `run lookup for https://example.com` or `why is mobile LCP slow on example.com?`
 
-The agent should **run** `./lookup` and analyze **that** run. It should not search old logs or read the source first.
+The agent should **run** `./lookup <url>` on Linux/macOS, or `lookup <url>` / `py -3 lookup <url>` on Windows, then analyze **that** run. It should not search old logs or read the source first.
 
 Instruction files are already in the repo so common agents pick this up without scanning the project:
 
@@ -344,7 +294,8 @@ The committed example key file is only a placeholder: `.pagespeed_api_key.exampl
 ## Project layout
 
 ```text
-lookup                 # main script
+lookup                 # main program (Python)
+lookup.cmd             # Windows launcher
 lib/pagespeed.py       # PageSpeed Insights helper
 .pagespeed_api_key.example
 AGENTS.md              # shared agent instructions

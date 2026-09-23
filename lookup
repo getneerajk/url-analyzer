@@ -1,423 +1,619 @@
-#!/bin/bash
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# 1. Check if a URL/Domain was passed
-if [ -z "$1" ]; then
-    echo "Usage: $0 <url-or-domain>"
-    exit 1
-fi
-
-# 2. Clean input
-INPUT="$1"
-DOMAIN=$(echo "$INPUT" | sed -e 's|^[^/]*//||' -e 's|/.*||')
-
-if [[ "$INPUT" == http://* || "$INPUT" == https://* ]]; then
-    FETCH_URL="$INPUT"
-else
-    FETCH_URL="https://$INPUT"
-fi
-
-DOMAIN_FN=$(echo "$DOMAIN" | tr '.' '_')
-
-# 3. Setup the Log Directory and File
-LOG_DIR="./log"
-mkdir -p "$LOG_DIR"
-
-TIMESTAMP=$(date "+%Y%m%d_%H%M%S")
-LOG_BASE="lookup_log_${DOMAIN_FN}_${TIMESTAMP}"
-RUN_DIR="$LOG_DIR/${LOG_BASE}"
-LOG_FILE="$RUN_DIR/${LOG_BASE}.log"
-mkdir -p "$RUN_DIR"
-
-# Flag arrays: SPEED_FLAGS shown in terminal; ALL_FLAGS for full log
-SPEED_FLAGS=()
-ALL_FLAGS=()
-
-# Diagnostic output buffers
-CURL_TIMING_OUTPUT=""
-MTR_OUTPUT=""
-AB_OUTPUT=""
-PAGESPEED_OUTPUT=""
-
-# --- Helpers ---
-
-cmd_available() {
-    command -v "$1" &>/dev/null
-}
-
-add_speed_flag() {
-    SPEED_FLAGS+=("$1|$2")
-    ALL_FLAGS+=("$1|$2")
-}
-
-add_flag() {
-    ALL_FLAGS+=("$1|$2")
-}
-
-float_gt() {
-    awk -v a="$1" -v b="$2" 'BEGIN { exit (a + 0 > b + 0) ? 0 : 1 }'
-}
-
-ms_from_seconds() {
-    awk -v s="$1" 'BEGIN { printf "%.0f", s * 1000 }'
-}
-
-get_header() {
-    echo "$HEADERS" | tail -n +2 | grep -i "^$1:" | head -1 | sed 's/^[^:]*:[[:space:]]*//'
-}
-
-has_header() {
-    echo "$HEADERS" | tail -n +2 | grep -qi "^$1:"
-}
-
-header_contains() {
-    local name="$1"
-    local pattern="$2"
-    local value
-    value=$(get_header "$name")
-    echo "$value" | grep -qi "$pattern"
-}
-
-print_table() {
-    echo "+---------------------------------------------------------------------------------+"
-    printf "| %-15s | %-57s |\n" "Metric" "Value"
-    echo "+---------------------------------------------------------------------------------+"
-    printf "| %-15s | %-57s |\n" "Domain/URL" "$FETCH_URL"
-    printf "| %-15s | %-57s |\n" "HTTP Status" "$HTTP_STATUS"
-    printf "| %-15s | %-57s |\n" "Nameservers" "${NS_RECORDS:0:57}"
-
-    while IFS= read -r line; do
-        [ -z "$line" ] && continue
-        HEADER_NAME="${line%%:*}"
-        HEADER_VALUE="${line#*: }"
-        printf "| %-15s | %-57s |\n" "${HEADER_NAME:0:15}" "${HEADER_VALUE:0:57}"
-    done < <(echo "$HEADERS" | tail -n +2)
-
-    echo "+---------------------------------------------------------------------------------+"
-}
-
-print_flag_list() {
-    local -n arr=$1
-    local title=$2
-    echo "$title"
-    echo ""
-    if [ ${#arr[@]} -eq 0 ]; then
-        echo "[OK]   No issues detected"
-        return
-    fi
-    for flag in "${arr[@]}"; do
-        local level="${flag%%|*}"
-        local message="${flag#*|}"
-        printf "[%s] %s\n" "$level" "$message"
-    done
-}
-
-analyze_cache_speed() {
-    local server lscache cf_cache cf_ray pragma
-
-    server=$(get_header "server")
-    lscache=$(get_header "x-litespeed-cache")
-    cf_cache=$(get_header "cf-cache-status")
-    cf_ray=$(get_header "cf-ray")
-    pragma=$(get_header "pragma")
-
-    # LiteSpeed cache — primary signal for origin speed
-    if echo "$server" | grep -qi "litespeed"; then
-        if echo "$lscache" | grep -qi "miss"; then
-            add_speed_flag "WARN" "LiteSpeed cache MISS — page generated dynamically every request (slow TTFB)"
-        elif echo "$lscache" | grep -qi "hit"; then
-            add_speed_flag "OK" "LiteSpeed cache HIT — page served from server cache"
-        else
-            add_speed_flag "WARN" "LiteSpeed server but no x-litespeed-cache header — cache may be off or bypassed"
-        fi
-    elif [ -n "$lscache" ]; then
-        if echo "$lscache" | grep -qi "miss"; then
-            add_speed_flag "WARN" "LiteSpeed cache MISS — x-litespeed-cache: $lscache"
-        elif echo "$lscache" | grep -qi "hit"; then
-            add_speed_flag "OK" "LiteSpeed cache HIT — x-litespeed-cache: $lscache"
-        fi
-    fi
-
-    # no-cache kills browser and CDN caching
-    if header_contains "cache-control" "no-cache" || \
-       header_contains "cache-control" "no-store" || \
-       echo "$pragma" | grep -qi "no-cache"; then
-        add_speed_flag "WARN" "no-cache/no-store headers — browser cannot cache; every visit hits origin (hurts repeat visits & TTFB)"
-    fi
-
-    if header_contains "expires" "1981"; then
-        add_speed_flag "WARN" "PHP session expires (1981) — page treated as dynamic/uncacheable"
-    fi
-
-    # Cloudflare CDN not active despite CF DNS
-    if echo "$NS_RECORDS" | grep -qi "cloudflare"; then
-        local cf_active=false
-        has_header "cf-cache-status" && cf_active=true
-        has_header "cf-ray" && cf_active=true
-        echo "$server" | grep -qi "cloudflare" && cf_active=true
-
-        if [ "$cf_active" = false ]; then
-            add_speed_flag "WARN" "Cloudflare DNS only (grey cloud?) — no CDN edge cache; traffic hits origin ($server) directly"
-        fi
-    fi
-
-    if [ -n "$cf_cache" ]; then
-        case "${cf_cache,,}" in
-            hit)     add_speed_flag "OK" "Cloudflare edge cache HIT — fast TTFB from CDN" ;;
-            dynamic) add_speed_flag "WARN" "Cloudflare DYNAMIC — HTML not cached at edge (slow for uncached pages)" ;;
-            bypass)  add_speed_flag "WARN" "Cloudflare BYPASS — cache rules skipped this page" ;;
-            expired) add_speed_flag "INFO" "Cloudflare EXPIRED — revalidating from origin" ;;
-        esac
-    fi
-
-    if ! has_header "content-encoding"; then
-        add_speed_flag "WARN" "No compression (gzip/brotli) — larger payloads slow LCP and FCP"
-    else
-        add_speed_flag "OK" "Compression enabled — $(get_header content-encoding)"
-    fi
-
-    if [ "$HTTP_STATUS" = "Failed to connect" ]; then
-        add_speed_flag "ERROR" "Failed to connect — site unreachable"
-    fi
-}
-
-analyze_security_flags() {
-    local hsts powered_by cors server
-    hsts=$(get_header "strict-transport-security")
-    powered_by=$(get_header "x-powered-by")
-    cors=$(get_header "access-control-allow-origin")
-    server=$(get_header "server")
-
-    if echo "$FETCH_URL" | grep -qi "^https://"; then
-        [ -z "$hsts" ] && add_flag "WARN" "Missing HSTS"
-    fi
-    if ! has_header "content-security-policy"; then
-        add_flag "INFO" "Missing Content-Security-Policy"
-    fi
-    [ -n "$powered_by" ] && add_flag "WARN" "x-powered-by exposed: $powered_by"
-    [ -n "$cors" ] && add_flag "INFO" "CORS: $cors"
-    [ -n "$server" ] && add_flag "INFO" "Server: $server"
-}
-
-run_curl_timing() {
-    if ! cmd_available curl; then
-        add_speed_flag "INFO" "curl not installed — skipped timing"
-        CURL_TIMING_OUTPUT="skipped"
-        return
-    fi
-
-    local timing
-    timing=$(curl -o /dev/null -s -w \
-        "time_namelookup:  %{time_namelookup}\ntime_connect:     %{time_connect}\ntime_appconnect:  %{time_appconnect}\ntime_pretransfer: %{time_pretransfer}\ntime_starttransfer: %{time_starttransfer}\ntime_total:       %{time_total}\nhttp_code:        %{http_code}\nsize_download:    %{size_download}\n" \
-        "$FETCH_URL" 2>&1)
-
-    CURL_TIMING_OUTPUT="$timing"
-
-    local dns connect tls ttfb total http_code
-    dns=$(echo "$timing" | awk '/time_namelookup/ {print $2}')
-    connect=$(echo "$timing" | awk '/time_connect/ {print $2}')
-    tls=$(echo "$timing" | awk '/time_appconnect/ {print $2}')
-    ttfb=$(echo "$timing" | awk '/time_starttransfer/ {print $2}')
-    total=$(echo "$timing" | awk '/time_total/ {print $2}')
-    http_code=$(echo "$timing" | awk '/http_code/ {print $2}')
-
-    add_speed_flag "INFO" "Network timing — DNS: $(ms_from_seconds "$dns")ms, Connect: $(ms_from_seconds "$connect")ms, TLS: $(ms_from_seconds "$tls")ms, TTFB: $(ms_from_seconds "$ttfb")ms, Total: $(ms_from_seconds "$total")ms"
-
-    float_gt "$ttfb" "0.800" && add_speed_flag "WARN" "Slow TTFB $(ms_from_seconds "$ttfb")ms (>800ms) — server/cache/origin bottleneck (hurts LCP)"
-    float_gt "$ttfb" "1.800" && add_speed_flag "WARN" "Very slow TTFB $(ms_from_seconds "$ttfb")ms (>1.8s) — major LCP killer"
-    float_gt "$total" "3.000" && add_speed_flag "WARN" "Slow total load $(ms_from_seconds "$total")ms (>3s) from this location"
-    float_gt "$dns" "0.100" && add_speed_flag "WARN" "Slow DNS $(ms_from_seconds "$dns")ms (>100ms)"
-}
-
-run_mtr_test() {
-    if ! cmd_available mtr; then
-        add_speed_flag "INFO" "mtr not installed — skipped route analysis"
-        MTR_OUTPUT="skipped"
-        return
-    fi
-
-    MTR_OUTPUT=$(mtr -r -c 10 -n "$DOMAIN" 2>&1)
-
-    local loss avg worst stdev
-    loss=$(echo "$MTR_OUTPUT" | awk '/\|--/ { gsub(/%/,"",$3); loss=$3; avg=$6; worst=$8; stdev=$9 } END { print loss }')
-    avg=$(echo "$MTR_OUTPUT" | awk '/\|--/ { avg=$6 } END { print avg }')
-    worst=$(echo "$MTR_OUTPUT" | awk '/\|--/ { worst=$8 } END { print worst }')
-    stdev=$(echo "$MTR_OUTPUT" | awk '/\|--/ { stdev=$9 } END { print stdev }')
-
-    add_speed_flag "INFO" "Route to origin — loss: ${loss:-?}%, avg: ${avg:-?}ms, worst: ${worst:-?}ms"
-
-    [ -n "$loss" ] && float_gt "$loss" "0" && \
-        add_speed_flag "WARN" "Packet loss ${loss}% on route — causes lag spikes and slow loads"
-    [ -n "$avg" ] && float_gt "$avg" "200" && \
-        add_speed_flag "WARN" "High network latency ${avg}ms to server — distant origin hurts global users"
-    [ -n "$stdev" ] && float_gt "$stdev" "50" && \
-        add_speed_flag "WARN" "Network jitter (stdev ${stdev}ms) — inconsistent load times"
-}
-
-run_ab_loadtest() {
-    if ! cmd_available ab; then
-        add_speed_flag "INFO" "ab not installed — skipped load test"
-        AB_OUTPUT="skipped"
-        return
-    fi
-
-    AB_OUTPUT=$(ab -n 50 -c 5 -k "$FETCH_URL" 2>&1)
-
-    local failed rps mean_ms p95
-    failed=$(echo "$AB_OUTPUT" | awk '/Failed requests/ {print $3}')
-    rps=$(echo "$AB_OUTPUT" | awk '/Requests per second/ {print $4}')
-    mean_ms=$(echo "$AB_OUTPUT" | awk '/Time per request/ && !/concurrent/ {print $4}')
-    p95=$(echo "$AB_OUTPUT" | awk '/95%/ {print $2}')
-
-    add_speed_flag "INFO" "Under load (50 req, 5 concurrent) — ${rps:-?} req/s, mean ${mean_ms:-?}ms, p95 ${p95:-?}ms"
-
-    [ -n "$failed" ] && [ "$failed" != "0" ] && \
-        add_speed_flag "WARN" "$failed failed requests under load — server struggles with concurrency"
-    [ -n "$mean_ms" ] && float_gt "$mean_ms" "2000" && \
-        add_speed_flag "WARN" "Slow under load — mean ${mean_ms}ms (>2s); origin may be underpowered"
-    [ -n "$rps" ] && awk -v rps="$rps" 'BEGIN { exit (rps + 0 < 5) ? 0 : 1 }' && \
-        add_speed_flag "WARN" "Low throughput ${rps} req/s — server/cache cannot handle traffic"
-}
-
-run_pagespeed() {
-    if ! cmd_available python3; then
-        add_speed_flag "ERROR" "python3 required for PageSpeed/Lighthouse analysis"
-        PAGESPEED_OUTPUT="python3 not installed"
-        return
-    fi
-
-    local psi_stderr
-    psi_stderr=$(mktemp)
-    PAGESPEED_OUTPUT=$(python3 "$SCRIPT_DIR/lib/pagespeed.py" "$FETCH_URL" "$RUN_DIR" 2>"$psi_stderr")
-    local psi_exit=$?
-
-    while IFS= read -r line; do
-        case "$line" in
-            FLAG\|*)
-                local level="${line#FLAG|}"
-                level="${level%%|*}"
-                local message="${line#*|}"
-                message="${message#${level}|}"
-                add_speed_flag "$level" "$message"
-                ;;
-        esac
-    done < "$psi_stderr"
-    rm -f "$psi_stderr"
-
-    if [ $psi_exit -ne 0 ] && [ -z "$PAGESPEED_OUTPUT" ]; then
-        PAGESPEED_OUTPUT="PageSpeed analysis failed — set PAGESPEED_API_KEY or .pagespeed_api_key"
-    fi
-}
-
-correlate_speed_causes() {
-    # Cross-reference header/cache signals with measured TTFB
-    local has_no_cache=false
-    local has_ls_miss=false
-    local has_slow_ttfb=false
-
-    for flag in "${SPEED_FLAGS[@]}"; do
-        echo "$flag" | grep -qi "no-cache\|no-store" && has_no_cache=true
-        echo "$flag" | grep -qi "litespeed cache miss" && has_ls_miss=true
-        echo "$flag" | grep -qi "slow ttfb\|very slow ttfb" && has_slow_ttfb=true
-    done
-
-    if $has_no_cache && $has_slow_ttfb; then
-        add_speed_flag "WARN" "Correlation: no-cache headers + slow TTFB — origin regenerates page every request"
-    fi
-    if $has_ls_miss && $has_slow_ttfb; then
-        add_speed_flag "WARN" "Correlation: LiteSpeed cache miss + slow TTFB — enable LSCache for this page type"
-    fi
-    if $has_no_cache && $has_ls_miss; then
-        add_speed_flag "WARN" "Correlation: LiteSpeed miss + no-cache — page fully dynamic; worst case for speed"
-    fi
-}
-
-run_speed_diagnostics() {
-    echo "Measuring network speed..."
-    run_curl_timing
-    run_mtr_test
-
-    echo "Running Lighthouse via PageSpeed API (may take 30-60s)..."
-    run_pagespeed
-
-    echo "Load testing origin..."
-    run_ab_loadtest
-
-    correlate_speed_causes
-}
-
-# 4. Fetch headers
-echo "Analyzing $DOMAIN..."
-
-if ! cmd_available curl; then
-    echo "Error: curl is required."
-    exit 1
-fi
-
-HEADERS=$(curl -sI "$FETCH_URL" 2>/dev/null | tr -d '\r')
-HTTP_STATUS=$(echo "$HEADERS" | head -n 1)
-[ -z "$HTTP_STATUS" ] && HTTP_STATUS="Failed to connect"
-
-NS_RECORDS=$(host -t ns "$DOMAIN" 2>/dev/null | awk '/name server/ {print $NF}' | tr '\n' ',' | sed 's/,$//' | sed 's/\.$//g')
-[ -z "$NS_RECORDS" ] && NS_RECORDS="No NS records found"
-
-analyze_cache_speed
-analyze_security_flags
-run_speed_diagnostics
-
-# 5. Terminal: speed-focused output
-echo ""
-if [ -n "$PAGESPEED_OUTPUT" ]; then
-    echo "$PAGESPEED_OUTPUT"
-    echo ""
-fi
-print_flag_list SPEED_FLAGS "=== Speed Analysis & Likely Causes ==="
-echo ""
-
-# 6. Log: everything
-{
-    echo "=========================================="
-    echo "SPEED LOG FOR: $FETCH_URL"
-    echo "Timestamp: $(date "+%Y-%m-%d %H:%M:%S")"
-    echo "=========================================="
-    echo ""
-    [ -n "$PAGESPEED_OUTPUT" ] && echo "$PAGESPEED_OUTPUT" && echo ""
-    print_flag_list SPEED_FLAGS "=== Speed Analysis & Likely Causes ==="
-    echo ""
-    print_flag_list ALL_FLAGS "=== All Flags (incl. security) ==="
-    echo ""
-    print_table
-    echo ""
-    echo "=========================================="
-    echo "Network Delay Profile (curl):"
-    echo "=========================================="
-    echo "$CURL_TIMING_OUTPUT"
-    echo ""
-    echo "=========================================="
-    echo "Packet Loss & Route (mtr):"
-    echo "=========================================="
-    echo "$MTR_OUTPUT"
-    echo ""
-    echo "=========================================="
-    echo "Load Test (ab):"
-    echo "=========================================="
-    echo "$AB_OUTPUT"
-    echo ""
-    echo "=========================================="
-    echo "Raw HTTP Headers:"
-    echo "=========================================="
-    echo "HTTP Status : $HTTP_STATUS"
-    echo "Nameservers : $NS_RECORDS"
-    echo ""
-    while IFS= read -r line; do
-        [ -z "$line" ] && continue
-        echo "$line"
-    done < <(echo "$HEADERS" | tail -n +2)
-    echo ""
-    echo "PageSpeed raw JSON saved to:"
-    echo "  $RUN_DIR/pagespeed_mobile.json"
-    echo "  $RUN_DIR/pagespeed_desktop.json"
-} > "$LOG_FILE"
-
-echo "Data saved to: $RUN_DIR/"
+#!/usr/bin/env python3
+"""Cross-platform URL speed analyzer. Run: lookup <url>  or  python3 lookup <url>"""
+
+from __future__ import annotations
+
+import http.client
+import re
+import shutil
+import socket
+import ssl
+import statistics
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def usage() -> None:
+    name = Path(sys.argv[0]).name
+    print(f"Usage: {name} <url-or-domain>")
+    print("   or: python3 lookup <url-or-domain>")
+
+
+def ms(seconds: float | None) -> int:
+    if seconds is None:
+        return 0
+    return int(round(seconds * 1000))
+
+
+class Analyzer:
+    def __init__(self, fetch_url: str, domain: str) -> None:
+        self.fetch_url = fetch_url
+        self.domain = domain
+        self.speed_flags: list[tuple[str, str]] = []
+        self.all_flags: list[tuple[str, str]] = []
+        self.headers: dict[str, str] = {}
+        self.header_order: list[tuple[str, str]] = []
+        self.http_status = "Failed to connect"
+        self.ns_records = "No NS records found"
+        self.timing_output = "skipped"
+        self.mtr_output = "skipped"
+        self.load_output = "skipped"
+        self.pagespeed_output = ""
+
+    def add_speed(self, level: str, message: str) -> None:
+        self.speed_flags.append((level, message))
+        self.all_flags.append((level, message))
+
+    def add_flag(self, level: str, message: str) -> None:
+        self.all_flags.append((level, message))
+
+    def get_header(self, name: str) -> str:
+        return self.headers.get(name.lower(), "")
+
+    def has_header(self, name: str) -> bool:
+        return name.lower() in self.headers
+
+    def header_contains(self, name: str, pattern: str) -> bool:
+        return pattern.lower() in self.get_header(name).lower()
+
+    def fetch_headers(self) -> None:
+        parsed = urlparse(self.fetch_url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            self.http_status = "Failed to connect"
+            return
+        host = parsed.hostname
+        port = parsed.port
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+        timeout = 30
+        headers = {
+            "User-Agent": "url-analyzer",
+            "Accept": "*/*",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "close",
+        }
+        try:
+            if parsed.scheme == "https":
+                conn: http.client.HTTPConnection = http.client.HTTPSConnection(
+                    host, port=port or 443, timeout=timeout
+                )
+            else:
+                conn = http.client.HTTPConnection(host, port=port or 80, timeout=timeout)
+            conn.request("HEAD", path, headers=headers)
+            resp = conn.getresponse()
+            self.http_status = f"HTTP {resp.status} {resp.reason}"
+            self.header_order = [(k, v) for k, v in resp.getheaders()]
+            self.headers = {k.lower(): v for k, v in self.header_order}
+            resp.read()
+            conn.close()
+        except Exception:
+            self.http_status = "Failed to connect"
+
+    def lookup_nameservers(self) -> None:
+        names: list[str] = []
+        if shutil.which("host"):
+            try:
+                out = subprocess.run(
+                    ["host", "-t", "ns", self.domain],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    check=False,
+                ).stdout
+                for match in re.finditer(r"name server\s+(\S+)", out, re.I):
+                    names.append(match.group(1).rstrip("."))
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        if not names and shutil.which("nslookup"):
+            try:
+                out = subprocess.run(
+                    ["nslookup", "-type=NS", self.domain],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    check=False,
+                ).stdout
+                for match in re.finditer(r"nameserver\s*=\s*(\S+)", out, re.I):
+                    names.append(match.group(1).rstrip("."))
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        if names:
+            # preserve order, drop dupes
+            seen: set[str] = set()
+            unique: list[str] = []
+            for name in names:
+                key = name.lower()
+                if key not in seen:
+                    seen.add(key)
+                    unique.append(name)
+            self.ns_records = ",".join(unique)
+
+    def analyze_cache_speed(self) -> None:
+        server = self.get_header("server")
+        lscache = self.get_header("x-litespeed-cache")
+        cf_cache = self.get_header("cf-cache-status")
+        pragma = self.get_header("pragma")
+
+        if re.search(r"litespeed", server, re.I):
+            if re.search(r"miss", lscache, re.I):
+                self.add_speed(
+                    "WARN",
+                    "LiteSpeed cache MISS — page generated dynamically every request (slow TTFB)",
+                )
+            elif re.search(r"hit", lscache, re.I):
+                self.add_speed("OK", "LiteSpeed cache HIT — page served from server cache")
+            else:
+                self.add_speed(
+                    "WARN",
+                    "LiteSpeed server but no x-litespeed-cache header — cache may be off or bypassed",
+                )
+        elif lscache:
+            if re.search(r"miss", lscache, re.I):
+                self.add_speed("WARN", f"LiteSpeed cache MISS — x-litespeed-cache: {lscache}")
+            elif re.search(r"hit", lscache, re.I):
+                self.add_speed("OK", f"LiteSpeed cache HIT — x-litespeed-cache: {lscache}")
+
+        if (
+            self.header_contains("cache-control", "no-cache")
+            or self.header_contains("cache-control", "no-store")
+            or re.search(r"no-cache", pragma, re.I)
+        ):
+            self.add_speed(
+                "WARN",
+                "no-cache/no-store headers — browser cannot cache; every visit hits origin (hurts repeat visits & TTFB)",
+            )
+
+        if self.header_contains("expires", "1981"):
+            self.add_speed("WARN", "PHP session expires (1981) — page treated as dynamic/uncacheable")
+
+        if re.search(r"cloudflare", self.ns_records, re.I):
+            cf_active = (
+                self.has_header("cf-cache-status")
+                or self.has_header("cf-ray")
+                or bool(re.search(r"cloudflare", server, re.I))
+            )
+            if not cf_active:
+                self.add_speed(
+                    "WARN",
+                    f"Cloudflare DNS only (grey cloud?) — no CDN edge cache; traffic hits origin ({server}) directly",
+                )
+
+        if cf_cache:
+            kind = cf_cache.strip().lower()
+            if kind == "hit":
+                self.add_speed("OK", "Cloudflare edge cache HIT — fast TTFB from CDN")
+            elif kind == "dynamic":
+                self.add_speed(
+                    "WARN", "Cloudflare DYNAMIC — HTML not cached at edge (slow for uncached pages)"
+                )
+            elif kind == "bypass":
+                self.add_speed("WARN", "Cloudflare BYPASS — cache rules skipped this page")
+            elif kind == "expired":
+                self.add_speed("INFO", "Cloudflare EXPIRED — revalidating from origin")
+
+        if not self.has_header("content-encoding"):
+            self.add_speed("WARN", "No compression (gzip/brotli) — larger payloads slow LCP and FCP")
+        else:
+            self.add_speed("OK", f"Compression enabled — {self.get_header('content-encoding')}")
+
+        if self.http_status == "Failed to connect":
+            self.add_speed("ERROR", "Failed to connect — site unreachable")
+
+    def analyze_security_flags(self) -> None:
+        hsts = self.get_header("strict-transport-security")
+        powered_by = self.get_header("x-powered-by")
+        cors = self.get_header("access-control-allow-origin")
+        server = self.get_header("server")
+
+        if self.fetch_url.lower().startswith("https://") and not hsts:
+            self.add_flag("WARN", "Missing HSTS")
+        if not self.has_header("content-security-policy"):
+            self.add_flag("INFO", "Missing Content-Security-Policy")
+        if powered_by:
+            self.add_flag("WARN", f"x-powered-by exposed: {powered_by}")
+        if cors:
+            self.add_flag("INFO", f"CORS: {cors}")
+        if server:
+            self.add_flag("INFO", f"Server: {server}")
+
+    def run_timing(self) -> None:
+        parsed = urlparse(self.fetch_url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            self.timing_output = "skipped"
+            self.add_speed("INFO", "Invalid URL — skipped timing")
+            return
+
+        host = parsed.hostname
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+
+        try:
+            t0 = time.perf_counter()
+            infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+            t_dns = time.perf_counter()
+            _family, socktype, proto, _canon, addr = infos[0]
+            sock = socket.socket(infos[0][0], socktype, proto)
+            sock.settimeout(30)
+            sock.connect(addr)
+            t_connect = time.perf_counter()
+            if parsed.scheme == "https":
+                ctx = ssl.create_default_context()
+                sock = ctx.wrap_socket(sock, server_hostname=host)
+            t_tls = time.perf_counter()
+            request = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {host}\r\n"
+                f"User-Agent: url-analyzer\r\n"
+                f"Accept: */*\r\n"
+                f"Connection: close\r\n\r\n"
+            ).encode("ascii")
+            sock.sendall(request)
+            first = sock.recv(1)
+            t_ttfb = time.perf_counter()
+            chunks = [first]
+            while True:
+                data = sock.recv(65536)
+                if not data:
+                    break
+                chunks.append(data)
+            t_end = time.perf_counter()
+            sock.close()
+            raw = b"".join(chunks)
+            size = len(raw)
+            status_line = raw.split(b"\r\n", 1)[0].decode("latin-1", errors="replace")
+            http_code = ""
+            match = re.search(r"\s(\d{3})\s", status_line + " ")
+            if match:
+                http_code = match.group(1)
+        except Exception as exc:
+            self.timing_output = f"timing failed: {exc}"
+            self.add_speed("WARN", f"Network timing failed: {exc}")
+            return
+
+        dns = t_dns - t0
+        connect = t_connect - t0
+        tls = t_tls - t0
+        ttfb = t_ttfb - t0
+        total = t_end - t0
+        self.timing_output = (
+            f"time_namelookup:  {dns:.6f}\n"
+            f"time_connect:     {connect:.6f}\n"
+            f"time_appconnect:  {tls:.6f}\n"
+            f"time_starttransfer: {ttfb:.6f}\n"
+            f"time_total:       {total:.6f}\n"
+            f"http_code:        {http_code}\n"
+            f"size_download:    {size}\n"
+        )
+        self.add_speed(
+            "INFO",
+            f"Network timing — DNS: {ms(dns)}ms, Connect: {ms(connect)}ms, "
+            f"TLS: {ms(tls)}ms, TTFB: {ms(ttfb)}ms, Total: {ms(total)}ms",
+        )
+        if ttfb > 0.800:
+            self.add_speed(
+                "WARN",
+                f"Slow TTFB {ms(ttfb)}ms (>800ms) — server/cache/origin bottleneck (hurts LCP)",
+            )
+        if ttfb > 1.800:
+            self.add_speed("WARN", f"Very slow TTFB {ms(ttfb)}ms (>1.8s) — major LCP killer")
+        if total > 3.000:
+            self.add_speed("WARN", f"Slow total load {ms(total)}ms (>3s) from this location")
+        if dns > 0.100:
+            self.add_speed("WARN", f"Slow DNS {ms(dns)}ms (>100ms)")
+
+    def run_mtr(self) -> None:
+        if not shutil.which("mtr"):
+            self.mtr_output = "skipped (mtr not installed — optional)"
+            self.add_speed("INFO", "mtr not installed — skipped route analysis")
+            return
+        try:
+            proc = subprocess.run(
+                ["mtr", "-r", "-c", "10", "-n", self.domain],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+            self.mtr_output = (proc.stdout or proc.stderr or "").strip() or "no output"
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self.mtr_output = f"mtr failed: {exc}"
+            self.add_speed("INFO", f"mtr failed — {exc}")
+            return
+
+        loss = avg = worst = stdev = ""
+        last: dict[str, str] = {}
+        for line in self.mtr_output.splitlines():
+            if "|--" not in line:
+                continue
+            parts = line.split()
+            if len(parts) >= 9:
+                last = {
+                    "loss": parts[2].replace("%", ""),
+                    "avg": parts[5],
+                    "worst": parts[7],
+                    "stdev": parts[8],
+                }
+        if last:
+            loss, avg, worst, stdev = last["loss"], last["avg"], last["worst"], last["stdev"]
+        self.add_speed(
+            "INFO",
+            f"Route to origin — loss: {loss or '?'}%, avg: {avg or '?'}ms, worst: {worst or '?'}ms",
+        )
+        try:
+            if loss and float(loss) > 0:
+                self.add_speed(
+                    "WARN",
+                    f"Packet loss {loss}% on route — causes lag spikes and slow loads",
+                )
+            if avg and float(avg) > 200:
+                self.add_speed(
+                    "WARN",
+                    f"High network latency {avg}ms to server — distant origin hurts global users",
+                )
+            if stdev and float(stdev) > 50:
+                self.add_speed(
+                    "WARN",
+                    f"Network jitter (stdev {stdev}ms) — inconsistent load times",
+                )
+        except ValueError:
+            pass
+
+    def _one_request(self) -> tuple[float, str | None]:
+        start = time.perf_counter()
+        try:
+            req = Request(
+                self.fetch_url,
+                headers={"User-Agent": "url-analyzer", "Connection": "close"},
+                method="GET",
+            )
+            with urlopen(req, timeout=30) as resp:
+                resp.read()
+            return time.perf_counter() - start, None
+        except Exception as exc:
+            return time.perf_counter() - start, str(exc)
+
+    def run_load_test(self) -> None:
+        count = 50
+        concurrency = 5
+        times: list[float] = []
+        failed = 0
+        t0 = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = [pool.submit(self._one_request) for _ in range(count)]
+            for fut in as_completed(futures):
+                elapsed, err = fut.result()
+                times.append(elapsed)
+                if err:
+                    failed += 1
+        wall = time.perf_counter() - t0
+        if not times:
+            self.load_output = "load test produced no samples"
+            return
+        times_sorted = sorted(times)
+        mean_ms = statistics.mean(times) * 1000
+        p95_ms = times_sorted[max(0, int(len(times_sorted) * 0.95) - 1)] * 1000
+        rps = count / wall if wall > 0 else 0.0
+        self.load_output = (
+            f"Requests:           {count}\n"
+            f"Concurrency:        {concurrency}\n"
+            f"Failed requests:    {failed}\n"
+            f"Requests per second: {rps:.2f}\n"
+            f"Time per request:   {mean_ms:.3f} ms (mean)\n"
+            f"95%:                {p95_ms:.0f}\n"
+        )
+        self.add_speed(
+            "INFO",
+            f"Under load ({count} req, {concurrency} concurrent) — "
+            f"{rps:.2f} req/s, mean {mean_ms:.0f}ms, p95 {p95_ms:.0f}ms",
+        )
+        if failed:
+            self.add_speed(
+                "WARN",
+                f"{failed} failed requests under load — server struggles with concurrency",
+            )
+        if mean_ms > 2000:
+            self.add_speed(
+                "WARN",
+                f"Slow under load — mean {mean_ms:.0f}ms (>2s); origin may be underpowered",
+            )
+        if rps < 5:
+            self.add_speed(
+                "WARN",
+                f"Low throughput {rps:.2f} req/s — server/cache cannot handle traffic",
+            )
+
+    def run_pagespeed(self, run_dir: Path) -> None:
+        script = SCRIPT_DIR / "lib" / "pagespeed.py"
+        if not script.is_file():
+            self.pagespeed_output = "lib/pagespeed.py not found"
+            self.add_speed("ERROR", "PageSpeed helper missing")
+            return
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(script), self.fetch_url, str(run_dir)],
+                capture_output=True,
+                text=True,
+                timeout=180,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self.pagespeed_output = f"PageSpeed analysis failed — {exc}"
+            self.add_speed("ERROR", f"PageSpeed failed: {exc}")
+            return
+
+        self.pagespeed_output = (proc.stdout or "").rstrip()
+        for line in (proc.stderr or "").splitlines():
+            if not line.startswith("FLAG|"):
+                continue
+            parts = line.split("|", 2)
+            if len(parts) == 3:
+                self.add_speed(parts[1], parts[2])
+        if proc.returncode != 0 and not self.pagespeed_output:
+            self.pagespeed_output = (
+                "PageSpeed analysis failed — set PAGESPEED_API_KEY or .pagespeed_api_key"
+            )
+
+    def correlate(self) -> None:
+        has_no_cache = any(
+            re.search(r"no-cache|no-store", msg, re.I) for _lvl, msg in self.speed_flags
+        )
+        has_ls_miss = any(re.search(r"litespeed cache miss", msg, re.I) for _lvl, msg in self.speed_flags)
+        has_slow_ttfb = any(
+            re.search(r"slow ttfb|very slow ttfb", msg, re.I) for _lvl, msg in self.speed_flags
+        )
+        if has_no_cache and has_slow_ttfb:
+            self.add_speed(
+                "WARN",
+                "Correlation: no-cache headers + slow TTFB — origin regenerates page every request",
+            )
+        if has_ls_miss and has_slow_ttfb:
+            self.add_speed(
+                "WARN",
+                "Correlation: LiteSpeed cache miss + slow TTFB — enable LSCache for this page type",
+            )
+        if has_no_cache and has_ls_miss:
+            self.add_speed(
+                "WARN",
+                "Correlation: LiteSpeed miss + no-cache — page fully dynamic; worst case for speed",
+            )
+
+    def format_flags(self, flags: list[tuple[str, str]], title: str) -> str:
+        lines = [title, ""]
+        if not flags:
+            lines.append("[OK]   No issues detected")
+            return "\n".join(lines)
+        for level, message in flags:
+            lines.append(f"[{level}] {message}")
+        return "\n".join(lines)
+
+    def format_table(self) -> str:
+        def row(metric: str, value: str) -> str:
+            return f"| {metric[:15]:<15} | {value[:57]:<57} |"
+
+        lines = [
+            "+---------------------------------------------------------------------------------+",
+            "| Metric          | Value                                                     |",
+            "+---------------------------------------------------------------------------------+",
+            row("Domain/URL", self.fetch_url),
+            row("HTTP Status", self.http_status),
+            row("Nameservers", self.ns_records),
+        ]
+        for name, value in self.header_order:
+            lines.append(row(name, value))
+        lines.append("+---------------------------------------------------------------------------------+")
+        return "\n".join(lines)
+
+
+def normalize_url(raw: str) -> tuple[str, str]:
+    raw = raw.strip()
+    if raw.startswith(("http://", "https://")):
+        fetch_url = raw
+    else:
+        fetch_url = f"https://{raw}"
+    parsed = urlparse(fetch_url)
+    domain = parsed.hostname or raw
+    return fetch_url, domain
+
+
+def main() -> int:
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        usage()
+        return 1 if len(sys.argv) < 2 else 0
+
+    fetch_url, domain = normalize_url(sys.argv[1])
+    domain_fn = domain.replace(".", "_")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_base = f"lookup_log_{domain_fn}_{timestamp}"
+    run_dir = Path("log") / log_base
+    run_dir.mkdir(parents=True, exist_ok=True)
+    log_file = run_dir / f"{log_base}.log"
+
+    analyzer = Analyzer(fetch_url, domain)
+    print(f"Analyzing {domain}...")
+    analyzer.fetch_headers()
+    analyzer.lookup_nameservers()
+    analyzer.analyze_cache_speed()
+    analyzer.analyze_security_flags()
+
+    print("Measuring network speed...")
+    analyzer.run_timing()
+    analyzer.run_mtr()
+    print("Running Lighthouse via PageSpeed API (may take 30-60s)...")
+    analyzer.run_pagespeed(run_dir)
+    print("Load testing origin...")
+    analyzer.run_load_test()
+    analyzer.correlate()
+
+    print()
+    if analyzer.pagespeed_output:
+        print(analyzer.pagespeed_output)
+        print()
+    print(analyzer.format_flags(analyzer.speed_flags, "=== Speed Analysis & Likely Causes ==="))
+    print()
+
+    log_body = "\n".join(
+        [
+            "==========================================",
+            f"SPEED LOG FOR: {fetch_url}",
+            f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "==========================================",
+            "",
+        ]
+    )
+    if analyzer.pagespeed_output:
+        log_body += analyzer.pagespeed_output + "\n\n"
+    log_body += (
+        analyzer.format_flags(analyzer.speed_flags, "=== Speed Analysis & Likely Causes ===")
+        + "\n\n"
+        + analyzer.format_flags(analyzer.all_flags, "=== All Flags (incl. security) ===")
+        + "\n\n"
+        + analyzer.format_table()
+        + "\n\n"
+        + "==========================================\n"
+        "Network Delay Profile:\n"
+        "==========================================\n"
+        f"{analyzer.timing_output}\n\n"
+        "==========================================\n"
+        "Packet Loss & Route (mtr):\n"
+        "==========================================\n"
+        f"{analyzer.mtr_output}\n\n"
+        "==========================================\n"
+        "Load Test:\n"
+        "==========================================\n"
+        f"{analyzer.load_output}\n\n"
+        "==========================================\n"
+        "Raw HTTP Headers:\n"
+        "==========================================\n"
+        f"HTTP Status : {analyzer.http_status}\n"
+        f"Nameservers : {analyzer.ns_records}\n\n"
+    )
+    for name, value in analyzer.header_order:
+        log_body += f"{name}: {value}\n"
+    log_body += (
+        f"\nPageSpeed raw JSON saved to:\n"
+        f"  {run_dir / 'pagespeed_mobile.json'}\n"
+        f"  {run_dir / 'pagespeed_desktop.json'}\n"
+    )
+    log_file.write_text(log_body, encoding="utf-8")
+    print(f"Data saved to: {run_dir}/")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        sys.exit(130)
