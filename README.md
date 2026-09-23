@@ -18,23 +18,64 @@ Typical flags cover cache HIT/MISS, TTFB, compression, Cloudflare/LiteSpeed, ren
 
 ## Requirements
 
-| Tool | Required? | Why |
-| --- | --- | --- |
-| `bash` | Yes | Runs `./lookup` |
-| `curl` | Yes | Headers and timing |
-| `python3` | Yes | PageSpeed / Lighthouse |
-| Google PageSpeed API key | Yes for Lighthouse | See [API key](#api-key) |
-| `host` | Optional | Nameserver lookup (`dnsutils` on Debian/Ubuntu) |
-| `mtr` | Optional | Route / packet-loss check |
-| `ab` | Optional | Light origin load test (`apache2-utils`) |
+No Node, pip, or Composer packages. `lib/pagespeed.py` uses Python’s standard library only.
 
-On Debian/Ubuntu:
+| Tool | Required? | Why | Debian/Ubuntu package |
+| --- | --- | --- | --- |
+| `bash` | Yes | Runs `./lookup` | (already installed) |
+| `curl` | Yes | Headers and timing | `curl` |
+| `python3` | Yes | PageSpeed / Lighthouse | `python3` |
+| Google PageSpeed API key | Yes for Lighthouse | See [API key](#api-key) | — |
+| `host` | Optional | Nameserver lookup | `dnsutils` or `bind9-dnsutils` |
+| `mtr` | Optional | Route / packet-loss check | `mtr-tiny` |
+| `ab` | Optional | Light origin load test | `apache2-utils` |
+
+If an optional tool is missing, lookup still runs and marks that section as skipped.
+
+### Install packages
+
+**Required** (do this first):
 
 ```bash
-sudo apt install curl python3 dnsutils mtr-tiny apache2-utils
+# Debian / Ubuntu
+sudo apt update
+sudo apt install -y curl python3
+
+# Fedora / RHEL
+sudo dnf install -y curl python3
+
+# macOS (Homebrew)
+brew install curl python3
 ```
 
-`mtr` and `ab` can be skipped. Lookup still runs; those sections are marked skipped.
+**Optional** (nameservers, route, load test):
+
+```bash
+# Debian / Ubuntu
+sudo apt install -y dnsutils mtr-tiny apache2-utils
+
+# Fedora / RHEL
+sudo dnf install -y bind-utils mtr httpd-tools
+
+# macOS (Homebrew) — `ab` comes from httpd; `host` comes from bind
+brew install bind mtr httpd
+```
+
+On newer Ubuntu, if `dnsutils` is not found, use `bind9-dnsutils` instead.
+
+**Everything on Debian/Ubuntu in one line:**
+
+```bash
+sudo apt update && sudo apt install -y curl python3 dnsutils mtr-tiny apache2-utils
+```
+
+Check what you have:
+
+```bash
+command -v bash curl python3 host mtr ab
+```
+
+`curl` and `python3` must print a path. The others can be missing.
 
 ## Setup
 
