@@ -1,0 +1,29 @@
+# Secrets and credentials — never commit
+.pagespeed_api_key
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+*secret*
+*token*
+
+# Local lookup output (client URLs, reports, personal run data)
+log/
+*.log
+
+# Local-only notes / client snippets
+snippets/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/

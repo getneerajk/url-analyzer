@@ -1,0 +1,423 @@
+#!/bin/bash
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# 1. Check if a URL/Domain was passed
+if [ -z "$1" ]; then
+    echo "Usage: $0 <url-or-domain>"
+    exit 1
+fi
+
+# 2. Clean input
+INPUT="$1"
+DOMAIN=$(echo "$INPUT" | sed -e 's|^[^/]*//||' -e 's|/.*||')
+
+if [[ "$INPUT" == http://* || "$INPUT" == https://* ]]; then
+    FETCH_URL="$INPUT"
+else
+    FETCH_URL="https://$INPUT"
+fi
+
+DOMAIN_FN=$(echo "$DOMAIN" | tr '.' '_')
+
+# 3. Setup the Log Directory and File
+LOG_DIR="./log"
+mkdir -p "$LOG_DIR"
+
+TIMESTAMP=$(date "+%Y%m%d_%H%M%S")
+LOG_BASE="lookup_log_${DOMAIN_FN}_${TIMESTAMP}"
+RUN_DIR="$LOG_DIR/${LOG_BASE}"
+LOG_FILE="$RUN_DIR/${LOG_BASE}.log"
+mkdir -p "$RUN_DIR"
+
+# Flag arrays: SPEED_FLAGS shown in terminal; ALL_FLAGS for full log
+SPEED_FLAGS=()
+ALL_FLAGS=()
+
+# Diagnostic output buffers
+CURL_TIMING_OUTPUT=""
+MTR_OUTPUT=""
+AB_OUTPUT=""
+PAGESPEED_OUTPUT=""
+
+# --- Helpers ---
+
+cmd_available() {
+    command -v "$1" &>/dev/null
+}
+
+add_speed_flag() {
+    SPEED_FLAGS+=("$1|$2")
+    ALL_FLAGS+=("$1|$2")
+}
+
+add_flag() {
+    ALL_FLAGS+=("$1|$2")
+}
+
+float_gt() {
+    awk -v a="$1" -v b="$2" 'BEGIN { exit (a + 0 > b + 0) ? 0 : 1 }'
+}
+
+ms_from_seconds() {
+    awk -v s="$1" 'BEGIN { printf "%.0f", s * 1000 }'
+}
+
+get_header() {
+    echo "$HEADERS" | tail -n +2 | grep -i "^$1:" | head -1 | sed 's/^[^:]*:[[:space:]]*//'
+}
+
+has_header() {
+    echo "$HEADERS" | tail -n +2 | grep -qi "^$1:"
+}
+
+header_contains() {
+    local name="$1"
+    local pattern="$2"
+    local value
+    value=$(get_header "$name")
+    echo "$value" | grep -qi "$pattern"
+}
+
+print_table() {
+    echo "+---------------------------------------------------------------------------------+"
+    printf "| %-15s | %-57s |\n" "Metric" "Value"
+    echo "+---------------------------------------------------------------------------------+"
+    printf "| %-15s | %-57s |\n" "Domain/URL" "$FETCH_URL"
+    printf "| %-15s | %-57s |\n" "HTTP Status" "$HTTP_STATUS"
+    printf "| %-15s | %-57s |\n" "Nameservers" "${NS_RECORDS:0:57}"
+
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        HEADER_NAME="${line%%:*}"
+        HEADER_VALUE="${line#*: }"
+        printf "| %-15s | %-57s |\n" "${HEADER_NAME:0:15}" "${HEADER_VALUE:0:57}"
+    done < <(echo "$HEADERS" | tail -n +2)
+
+    echo "+---------------------------------------------------------------------------------+"
+}
+
+print_flag_list() {
+    local -n arr=$1
+    local title=$2
+    echo "$title"
+    echo ""
+    if [ ${#arr[@]} -eq 0 ]; then
+        echo "[OK]   No issues detected"
+        return
+    fi
+    for flag in "${arr[@]}"; do
+        local level="${flag%%|*}"
+        local message="${flag#*|}"
+        printf "[%s] %s\n" "$level" "$message"
+    done
+}
+
+analyze_cache_speed() {
+    local server lscache cf_cache cf_ray pragma
+
+    server=$(get_header "server")
+    lscache=$(get_header "x-litespeed-cache")
+    cf_cache=$(get_header "cf-cache-status")
+    cf_ray=$(get_header "cf-ray")
+    pragma=$(get_header "pragma")
+
+    # LiteSpeed cache — primary signal for origin speed
+    if echo "$server" | grep -qi "litespeed"; then
+        if echo "$lscache" | grep -qi "miss"; then
+            add_speed_flag "WARN" "LiteSpeed cache MISS — page generated dynamically every request (slow TTFB)"
+        elif echo "$lscache" | grep -qi "hit"; then
+            add_speed_flag "OK" "LiteSpeed cache HIT — page served from server cache"
+        else
+            add_speed_flag "WARN" "LiteSpeed server but no x-litespeed-cache header — cache may be off or bypassed"
+        fi
+    elif [ -n "$lscache" ]; then
+        if echo "$lscache" | grep -qi "miss"; then
+            add_speed_flag "WARN" "LiteSpeed cache MISS — x-litespeed-cache: $lscache"
+        elif echo "$lscache" | grep -qi "hit"; then
+            add_speed_flag "OK" "LiteSpeed cache HIT — x-litespeed-cache: $lscache"
+        fi
+    fi
+
+    # no-cache kills browser and CDN caching
+    if header_contains "cache-control" "no-cache" || \
+       header_contains "cache-control" "no-store" || \
+       echo "$pragma" | grep -qi "no-cache"; then
+        add_speed_flag "WARN" "no-cache/no-store headers — browser cannot cache; every visit hits origin (hurts repeat visits & TTFB)"
+    fi
+
+    if header_contains "expires" "1981"; then
+        add_speed_flag "WARN" "PHP session expires (1981) — page treated as dynamic/uncacheable"
+    fi
+
+    # Cloudflare CDN not active despite CF DNS
+    if echo "$NS_RECORDS" | grep -qi "cloudflare"; then
+        local cf_active=false
+        has_header "cf-cache-status" && cf_active=true
+        has_header "cf-ray" && cf_active=true
+        echo "$server" | grep -qi "cloudflare" && cf_active=true
+
+        if [ "$cf_active" = false ]; then
+            add_speed_flag "WARN" "Cloudflare DNS only (grey cloud?) — no CDN edge cache; traffic hits origin ($server) directly"
+        fi
+    fi
+
+    if [ -n "$cf_cache" ]; then
+        case "${cf_cache,,}" in
+            hit)     add_speed_flag "OK" "Cloudflare edge cache HIT — fast TTFB from CDN" ;;
+            dynamic) add_speed_flag "WARN" "Cloudflare DYNAMIC — HTML not cached at edge (slow for uncached pages)" ;;
+            bypass)  add_speed_flag "WARN" "Cloudflare BYPASS — cache rules skipped this page" ;;
+            expired) add_speed_flag "INFO" "Cloudflare EXPIRED — revalidating from origin" ;;
+        esac
+    fi
+
+    if ! has_header "content-encoding"; then
+        add_speed_flag "WARN" "No compression (gzip/brotli) — larger payloads slow LCP and FCP"
+    else
+        add_speed_flag "OK" "Compression enabled — $(get_header content-encoding)"
+    fi
+
+    if [ "$HTTP_STATUS" = "Failed to connect" ]; then
+        add_speed_flag "ERROR" "Failed to connect — site unreachable"
+    fi
+}
+
+analyze_security_flags() {
+    local hsts powered_by cors server
+    hsts=$(get_header "strict-transport-security")
+    powered_by=$(get_header "x-powered-by")
+    cors=$(get_header "access-control-allow-origin")
+    server=$(get_header "server")
+
+    if echo "$FETCH_URL" | grep -qi "^https://"; then
+        [ -z "$hsts" ] && add_flag "WARN" "Missing HSTS"
+    fi
+    if ! has_header "content-security-policy"; then
+        add_flag "INFO" "Missing Content-Security-Policy"
+    fi
+    [ -n "$powered_by" ] && add_flag "WARN" "x-powered-by exposed: $powered_by"
+    [ -n "$cors" ] && add_flag "INFO" "CORS: $cors"
+    [ -n "$server" ] && add_flag "INFO" "Server: $server"
+}
+
+run_curl_timing() {
+    if ! cmd_available curl; then
+        add_speed_flag "INFO" "curl not installed — skipped timing"
+        CURL_TIMING_OUTPUT="skipped"
+        return
+    fi
+
+    local timing
+    timing=$(curl -o /dev/null -s -w \
+        "time_namelookup:  %{time_namelookup}\ntime_connect:     %{time_connect}\ntime_appconnect:  %{time_appconnect}\ntime_pretransfer: %{time_pretransfer}\ntime_starttransfer: %{time_starttransfer}\ntime_total:       %{time_total}\nhttp_code:        %{http_code}\nsize_download:    %{size_download}\n" \
+        "$FETCH_URL" 2>&1)
+
+    CURL_TIMING_OUTPUT="$timing"
+
+    local dns connect tls ttfb total http_code
+    dns=$(echo "$timing" | awk '/time_namelookup/ {print $2}')
+    connect=$(echo "$timing" | awk '/time_connect/ {print $2}')
+    tls=$(echo "$timing" | awk '/time_appconnect/ {print $2}')
+    ttfb=$(echo "$timing" | awk '/time_starttransfer/ {print $2}')
+    total=$(echo "$timing" | awk '/time_total/ {print $2}')
+    http_code=$(echo "$timing" | awk '/http_code/ {print $2}')
+
+    add_speed_flag "INFO" "Network timing — DNS: $(ms_from_seconds "$dns")ms, Connect: $(ms_from_seconds "$connect")ms, TLS: $(ms_from_seconds "$tls")ms, TTFB: $(ms_from_seconds "$ttfb")ms, Total: $(ms_from_seconds "$total")ms"
+
+    float_gt "$ttfb" "0.800" && add_speed_flag "WARN" "Slow TTFB $(ms_from_seconds "$ttfb")ms (>800ms) — server/cache/origin bottleneck (hurts LCP)"
+    float_gt "$ttfb" "1.800" && add_speed_flag "WARN" "Very slow TTFB $(ms_from_seconds "$ttfb")ms (>1.8s) — major LCP killer"
+    float_gt "$total" "3.000" && add_speed_flag "WARN" "Slow total load $(ms_from_seconds "$total")ms (>3s) from this location"
+    float_gt "$dns" "0.100" && add_speed_flag "WARN" "Slow DNS $(ms_from_seconds "$dns")ms (>100ms)"
+}
+
+run_mtr_test() {
+    if ! cmd_available mtr; then
+        add_speed_flag "INFO" "mtr not installed — skipped route analysis"
+        MTR_OUTPUT="skipped"
+        return
+    fi
+
+    MTR_OUTPUT=$(mtr -r -c 10 -n "$DOMAIN" 2>&1)
+
+    local loss avg worst stdev
+    loss=$(echo "$MTR_OUTPUT" | awk '/\|--/ { gsub(/%/,"",$3); loss=$3; avg=$6; worst=$8; stdev=$9 } END { print loss }')
+    avg=$(echo "$MTR_OUTPUT" | awk '/\|--/ { avg=$6 } END { print avg }')
+    worst=$(echo "$MTR_OUTPUT" | awk '/\|--/ { worst=$8 } END { print worst }')
+    stdev=$(echo "$MTR_OUTPUT" | awk '/\|--/ { stdev=$9 } END { print stdev }')
+
+    add_speed_flag "INFO" "Route to origin — loss: ${loss:-?}%, avg: ${avg:-?}ms, worst: ${worst:-?}ms"
+
+    [ -n "$loss" ] && float_gt "$loss" "0" && \
+        add_speed_flag "WARN" "Packet loss ${loss}% on route — causes lag spikes and slow loads"
+    [ -n "$avg" ] && float_gt "$avg" "200" && \
+        add_speed_flag "WARN" "High network latency ${avg}ms to server — distant origin hurts global users"
+    [ -n "$stdev" ] && float_gt "$stdev" "50" && \
+        add_speed_flag "WARN" "Network jitter (stdev ${stdev}ms) — inconsistent load times"
+}
+
+run_ab_loadtest() {
+    if ! cmd_available ab; then
+        add_speed_flag "INFO" "ab not installed — skipped load test"
+        AB_OUTPUT="skipped"
+        return
+    fi
+
+    AB_OUTPUT=$(ab -n 50 -c 5 -k "$FETCH_URL" 2>&1)
+
+    local failed rps mean_ms p95
+    failed=$(echo "$AB_OUTPUT" | awk '/Failed requests/ {print $3}')
+    rps=$(echo "$AB_OUTPUT" | awk '/Requests per second/ {print $4}')
+    mean_ms=$(echo "$AB_OUTPUT" | awk '/Time per request/ && !/concurrent/ {print $4}')
+    p95=$(echo "$AB_OUTPUT" | awk '/95%/ {print $2}')
+
+    add_speed_flag "INFO" "Under load (50 req, 5 concurrent) — ${rps:-?} req/s, mean ${mean_ms:-?}ms, p95 ${p95:-?}ms"
+
+    [ -n "$failed" ] && [ "$failed" != "0" ] && \
+        add_speed_flag "WARN" "$failed failed requests under load — server struggles with concurrency"
+    [ -n "$mean_ms" ] && float_gt "$mean_ms" "2000" && \
+        add_speed_flag "WARN" "Slow under load — mean ${mean_ms}ms (>2s); origin may be underpowered"
+    [ -n "$rps" ] && awk -v rps="$rps" 'BEGIN { exit (rps + 0 < 5) ? 0 : 1 }' && \
+        add_speed_flag "WARN" "Low throughput ${rps} req/s — server/cache cannot handle traffic"
+}
+
+run_pagespeed() {
+    if ! cmd_available python3; then
+        add_speed_flag "ERROR" "python3 required for PageSpeed/Lighthouse analysis"
+        PAGESPEED_OUTPUT="python3 not installed"
+        return
+    fi
+
+    local psi_stderr
+    psi_stderr=$(mktemp)
+    PAGESPEED_OUTPUT=$(python3 "$SCRIPT_DIR/lib/pagespeed.py" "$FETCH_URL" "$RUN_DIR" 2>"$psi_stderr")
+    local psi_exit=$?
+
+    while IFS= read -r line; do
+        case "$line" in
+            FLAG\|*)
+                local level="${line#FLAG|}"
+                level="${level%%|*}"
+                local message="${line#*|}"
+                message="${message#${level}|}"
+                add_speed_flag "$level" "$message"
+                ;;
+        esac
+    done < "$psi_stderr"
+    rm -f "$psi_stderr"
+
+    if [ $psi_exit -ne 0 ] && [ -z "$PAGESPEED_OUTPUT" ]; then
+        PAGESPEED_OUTPUT="PageSpeed analysis failed — set PAGESPEED_API_KEY or .pagespeed_api_key"
+    fi
+}
+
+correlate_speed_causes() {
+    # Cross-reference header/cache signals with measured TTFB
+    local has_no_cache=false
+    local has_ls_miss=false
+    local has_slow_ttfb=false
+
+    for flag in "${SPEED_FLAGS[@]}"; do
+        echo "$flag" | grep -qi "no-cache\|no-store" && has_no_cache=true
+        echo "$flag" | grep -qi "litespeed cache miss" && has_ls_miss=true
+        echo "$flag" | grep -qi "slow ttfb\|very slow ttfb" && has_slow_ttfb=true
+    done
+
+    if $has_no_cache && $has_slow_ttfb; then
+        add_speed_flag "WARN" "Correlation: no-cache headers + slow TTFB — origin regenerates page every request"
+    fi
+    if $has_ls_miss && $has_slow_ttfb; then
+        add_speed_flag "WARN" "Correlation: LiteSpeed cache miss + slow TTFB — enable LSCache for this page type"
+    fi
+    if $has_no_cache && $has_ls_miss; then
+        add_speed_flag "WARN" "Correlation: LiteSpeed miss + no-cache — page fully dynamic; worst case for speed"
+    fi
+}
+
+run_speed_diagnostics() {
+    echo "Measuring network speed..."
+    run_curl_timing
+    run_mtr_test
+
+    echo "Running Lighthouse via PageSpeed API (may take 30-60s)..."
+    run_pagespeed
+
+    echo "Load testing origin..."
+    run_ab_loadtest
+
+    correlate_speed_causes
+}
+
+# 4. Fetch headers
+echo "Analyzing $DOMAIN..."
+
+if ! cmd_available curl; then
+    echo "Error: curl is required."
+    exit 1
+fi
+
+HEADERS=$(curl -sI "$FETCH_URL" 2>/dev/null | tr -d '\r')
+HTTP_STATUS=$(echo "$HEADERS" | head -n 1)
+[ -z "$HTTP_STATUS" ] && HTTP_STATUS="Failed to connect"
+
+NS_RECORDS=$(host -t ns "$DOMAIN" 2>/dev/null | awk '/name server/ {print $NF}' | tr '\n' ',' | sed 's/,$//' | sed 's/\.$//g')
+[ -z "$NS_RECORDS" ] && NS_RECORDS="No NS records found"
+
+analyze_cache_speed
+analyze_security_flags
+run_speed_diagnostics
+
+# 5. Terminal: speed-focused output
+echo ""
+if [ -n "$PAGESPEED_OUTPUT" ]; then
+    echo "$PAGESPEED_OUTPUT"
+    echo ""
+fi
+print_flag_list SPEED_FLAGS "=== Speed Analysis & Likely Causes ==="
+echo ""
+
+# 6. Log: everything
+{
+    echo "=========================================="
+    echo "SPEED LOG FOR: $FETCH_URL"
+    echo "Timestamp: $(date "+%Y-%m-%d %H:%M:%S")"
+    echo "=========================================="
+    echo ""
+    [ -n "$PAGESPEED_OUTPUT" ] && echo "$PAGESPEED_OUTPUT" && echo ""
+    print_flag_list SPEED_FLAGS "=== Speed Analysis & Likely Causes ==="
+    echo ""
+    print_flag_list ALL_FLAGS "=== All Flags (incl. security) ==="
+    echo ""
+    print_table
+    echo ""
+    echo "=========================================="
+    echo "Network Delay Profile (curl):"
+    echo "=========================================="
+    echo "$CURL_TIMING_OUTPUT"
+    echo ""
+    echo "=========================================="
+    echo "Packet Loss & Route (mtr):"
+    echo "=========================================="
+    echo "$MTR_OUTPUT"
+    echo ""
+    echo "=========================================="
+    echo "Load Test (ab):"
+    echo "=========================================="
+    echo "$AB_OUTPUT"
+    echo ""
+    echo "=========================================="
+    echo "Raw HTTP Headers:"
+    echo "=========================================="
+    echo "HTTP Status : $HTTP_STATUS"
+    echo "Nameservers : $NS_RECORDS"
+    echo ""
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        echo "$line"
+    done < <(echo "$HEADERS" | tail -n +2)
+    echo ""
+    echo "PageSpeed raw JSON saved to:"
+    echo "  $RUN_DIR/pagespeed_mobile.json"
+    echo "  $RUN_DIR/pagespeed_desktop.json"
+} > "$LOG_FILE"
+
+echo "Data saved to: $RUN_DIR/"

@@ -1,0 +1,8 @@
+# Get a free API key from Google Cloud Console:
+# 1. Enable PageSpeed Insights API:
+#    https://console.cloud.google.com/apis/library/pagespeedonline.googleapis.com
+# 2. Create credentials (API key):
+#    https://console.cloud.google.com/apis/credentials
+# 3. Paste your key below (one line, no quotes):
+
+YOUR_API_KEY_HERE
