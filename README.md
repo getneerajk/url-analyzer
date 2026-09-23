@@ -1,6 +1,6 @@
 # url-analyzer
 
-**Version 2** (this branch: `v2`). What changed is in [CHANGELOG.md](CHANGELOG.md). The original Bash release stays on [`main`](https://github.com/getneerajk/url-analyzer/tree/main).
+**Version 2** on [`main`](https://github.com/getneerajk/url-analyzer/tree/main). What changed is in [CHANGELOG.md](CHANGELOG.md). The original Bash release is on [`v1`](https://github.com/getneerajk/url-analyzer/tree/v1).
 
 A command-line tool that checks a website’s **speed, caching, and Core Web Vitals**. It fetches HTTP headers, measures network timing, runs Google PageSpeed Insights (Lighthouse) for mobile and desktop, and writes a dated report you (or an AI agent) can read.
 

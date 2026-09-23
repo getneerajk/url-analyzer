@@ -4,7 +4,7 @@ All notable changes to this project are documented here.
 
 ## [2.0.0] — 2026-09-23
 
-Branch: `v2`. The previous Bash-based tool remains on `main` (v1).
+Default branch: `main`. The previous Bash-based tool is on `v1`.
 
 ### Changed
 
@@ -34,4 +34,4 @@ Branch: `v2`. The previous Bash-based tool remains on `main` (v1).
 
 ## [1.0.0] — 2026-09-23
 
-Initial public release on `main`: Bash `lookup`, curl timing, optional `mtr`/`ab`, Cursor/Codex/Antigravity agent rules, and OS install notes that used WSL on Windows.
+Initial public release (branch `v1`): Bash `lookup`, curl timing, optional `mtr`/`ab`, Cursor/Codex/Antigravity agent rules, and OS install notes that used WSL on Windows.
